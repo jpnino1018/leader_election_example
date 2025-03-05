@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-"""
-Implementación de Leader Election utilizando Azure Blob Storage
-Este script simula múltiples nodos que compiten por ser el líder.
-"""
 
 import os
 import sys
@@ -31,7 +27,7 @@ class LeaderElection:
         self.running = False
         self.heartbeat_thread = None
         
-        # Azure Blob Storage
+        # Conexión a Azure Blob Storage
         connection_string = f"DefaultEndpointsProtocol=https;AccountName={storage_account_name};AccountKey={storage_account_key};EndpointSuffix=core.windows.net"
         self.blob_service_client = BlobServiceClient.from_connection_string(connection_string)
         self.container_client = self.blob_service_client.get_container_client(container_name)
@@ -41,21 +37,31 @@ class LeaderElection:
     
     def _ensure_blob_exists(self):
         try:
-            content = json.dumps({
-                "created_at": datetime.datetime.now().isoformat(),
-                "created_by": self.node_id,
-                "leaders": []
-            }).encode('utf-8')
-            
-            self.blob_client.upload_blob(content, overwrite=False)
-            print(f"Blob '{self.blob_name}' creado para la elección de líder.")
-        except ResourceExistsError:
-            print(f"Blob '{self.blob_name}' ya existe. Continuando con el proceso.")
+            # Verificar si el blob existe
+            try:
+                self.blob_client.get_blob_properties()
+                print(f"Blob '{self.blob_name}' ya existe. Continuando con el proceso.")
+                return
+            except ResourceNotFoundError:
+                # El blob no existe
+                content = json.dumps({
+                    "created_at": datetime.datetime.now().isoformat(),
+                    "created_by": self.node_id,
+                    "leaders": []
+                }).encode('utf-8')
+                
+                self.blob_client.upload_blob(content, overwrite=False)
+                print(f"Blob '{self.blob_name}' creado para la elección de líder.")
+        except Exception as e:
+            print(f"Error al verificar o crear el blob: {str(e)}")
+            # Si el error es por lease, simplemente continuamos
+            if "LeaseIdMissing" in str(e):
+                print("El blob ya está bajo control de un líder. Intentando adquirir liderazgo...")
     
     def try_acquire_leadership(self):
-        """Intenta adquirir el liderazgo obteniendo un lease en el blob."""
+        #Intenta adquirir el liderazgo obteniendo un lease en el blob
         try:
-            # Creacion del cliente de lease para el blob
+            # Crear un cliente de lease para el blob
             lease_client = BlobLeaseClient(client=self.blob_client)
             
             # Intentar adquirir el lease
@@ -63,20 +69,30 @@ class LeaderElection:
             self.is_leader = True
             
             # Actualizar el blob con la información del nuevo líder
-            self._update_leader_info()
+            try:
+                self._update_leader_info()
+            except Exception as e:
+                print(f"Error al actualizar información del líder, pero el lease fue adquirido: {str(e)}")
+                # El nodo sigue siendo líder aunque no pudo actualizar la info
             
             print(f"¡Nodo {self.node_id} es ahora el LÍDER!")
             return True
         except Exception as e:
-            print(f"No se pudo adquirir el liderazgo: {str(e)}")
+            if "LeaseAlreadyPresent" in str(e):
+                current_leader = self.get_current_leader()
+                leader_info = f"(posiblemente {current_leader['node_id']})" if current_leader else ""
+                print(f"Otro nodo ya es el líder {leader_info}. Esperando...")
+            else:
+                print(f"No se pudo adquirir el liderazgo: {str(e)}")
+            
             self.is_leader = False
             return False
     
     def _update_leader_info(self):
-        """Actualiza la información del líder en el blob."""
+        #Actualiza la información del líder en el blob
         try:
             # Descargar contenido actual
-            download = self.blob_client.download_blob()
+            download = self.blob_client.download_blob(lease_id=self.lease_id)
             content = json.loads(download.readall().decode('utf-8'))
             
             # Añadir información del nuevo líder
@@ -92,9 +108,11 @@ class LeaderElection:
                                        lease_id=self.lease_id)
         except Exception as e:
             print(f"Error al actualizar la información del líder: {str(e)}")
+            # Propagamos la excepción para que pueda ser manejada
+            raise
     
     def renew_lease(self):
-        #Renovacion del lease para mantener el liderazgo.
+        #Renueva el lease para mantener el liderazgo
         if not self.is_leader or not self.lease_id:
             return False
         
@@ -110,7 +128,7 @@ class LeaderElection:
             return False
     
     def release_leadership(self):
-        #liberacion voluntaria del liderazgo
+        #Libera voluntariamente el liderazgo
         if not self.is_leader or not self.lease_id:
             return
         
@@ -137,7 +155,7 @@ class LeaderElection:
                 # Si no somos líderes, intentamos adquirir el liderazgo
                 self.try_acquire_leadership()
             
-            # Esperar antes del próximo intento (renovación o adquisición)
+            # Esperar antes del próximo intento 
             time.sleep(max(5, self.lease_duration / 3))
     
     def start(self):
@@ -164,7 +182,7 @@ class LeaderElection:
         self.running = False
         print(f"Deteniendo nodo {self.node_id}...")
         
-        #Liberar el liderazgo si es líderes
+        # Liberar el liderazgo si somos líderes
         if self.is_leader:
             self.release_leadership()
         
@@ -175,42 +193,59 @@ class LeaderElection:
     def get_current_leader(self):
         #Obtiene información sobre el líder actual
         try:
+            # Intentamos descargar el blob sin especificar lease_id
+            # Esto funcionará aunque no seamos el líder
             download = self.blob_client.download_blob()
             content = json.loads(download.readall().decode('utf-8'))
             
             if content["leaders"]:
                 return content["leaders"][-1]
             return None
+        except ResourceNotFoundError:
+            # El blob no existe todavía
+            print("Aún no se ha establecido ningún líder.")
+            return None
         except Exception as e:
             print(f"Error al obtener información del líder actual: {str(e)}")
+            # No debemos fallar completamente si no podemos obtener la info del líder
             return None
 
 def simulate_node(account_name, account_key, container_name, node_name, duration=120):
     #Simula un nodo participando en la elección de líder
-    node = LeaderElection(account_name, account_key, container_name, node_id=node_name)
-    
     try:
-        print(f"Iniciando simulación del nodo {node_name} por {duration} segundos...")
-        node.start()
+        node = LeaderElection(account_name, account_key, container_name, node_id=node_name)
         
-        # Ejecutar por la duración especificada
-        end_time = time.time() + duration
-        while time.time() < end_time:
-            status = "LÍDER" if node.is_leader else "seguidor"
-            current_leader = node.get_current_leader()
-            leader_info = f"(Líder actual: {current_leader['node_id']})" if current_leader else "(Sin líder)"
+        try:
+            print(f"Iniciando simulación del nodo {node_name} por {duration} segundos...")
+            node.start()
             
-            print(f"Nodo {node_name} es {status} {leader_info}")
-            time.sleep(10)
-            
-            # Simular una caída aleatoria (1% de probabilidad)
-            if node.is_leader and time.time() % 100 < 1:
-                print(f"¡Simulando caída del líder {node_name}!")
+            # Ejecutar por la duración especificada
+            end_time = time.time() + duration
+            while time.time() < end_time:
+                try:
+                    status = "LÍDER" if node.is_leader else "seguidor"
+                    current_leader = node.get_current_leader()
+                    leader_info = f"(Líder actual: {current_leader['node_id']})" if current_leader else "(Sin líder)"
+                    
+                    print(f"Nodo {node_name} es {status} {leader_info}")
+                    
+                    # Simular una caída aleatoria 
+                    if node.is_leader and time.time() % 100 < 1:
+                        print(f"¡Simulando caída del líder {node_name}!")
+                        node.stop()
+                        time.sleep(5)
+                        node.start()
+                except Exception as e:
+                    print(f"Error durante la simulación: {str(e)}")
+                time.sleep(10)
+        finally:
+            try:
                 node.stop()
-                time.sleep(5)
-                node.start()
-    finally:
-        node.stop()
+            except Exception as e:
+                print(f"Error al detener el nodo: {str(e)}")
+    except Exception as e:
+        print(f"Error crítico que impide iniciar el nodo {node_name}: {str(e)}")
+        
 
 def main():
     parser = argparse.ArgumentParser(description="Simulador de Leader Election con Azure Blob Storage")
