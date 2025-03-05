@@ -225,7 +225,7 @@ def simulate_node(account_name, account_key, container_name, node_name, duration
                 try:
                     status = "LÍDER" if node.is_leader else "seguidor"
                     current_leader = node.get_current_leader()
-                    leader_info = f"(Líder actual: {current_leader['node_id']})" if current_leader else "(Sin líder)"
+                    leader_info = f"(Líder actual: {current_leader['node_id']})" if current_leader else ""
                     
                     print(f"Nodo {node_name} es {status} {leader_info}")
                     
